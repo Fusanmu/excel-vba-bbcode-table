@@ -1,6 +1,36 @@
 Option Explicit
 
 '========================
+' Windows Unicode 剪贴板 API（兼容 32/64 位 Office）
+'========================
+#If VBA7 Then
+    Private Declare PtrSafe Function OpenClipboard Lib "user32" (ByVal hwnd As LongPtr) As Long
+    Private Declare PtrSafe Function EmptyClipboard Lib "user32" () As Long
+    Private Declare PtrSafe Function CloseClipboard Lib "user32" () As Long
+    Private Declare PtrSafe Function SetClipboardData Lib "user32" (ByVal wFormat As Long, ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalAlloc Lib "kernel32" (ByVal wFlags As Long, ByVal dwBytes As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalLock Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalUnlock Lib "kernel32" (ByVal hMem As LongPtr) As Long
+    Private Declare PtrSafe Function GlobalFree Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function lstrcpyW Lib "kernel32" (ByVal lpString1 As LongPtr, ByVal lpString2 As LongPtr) As LongPtr
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Private Declare Function OpenClipboard Lib "user32" (ByVal hwnd As Long) As Long
+    Private Declare Function EmptyClipboard Lib "user32" () As Long
+    Private Declare Function CloseClipboard Lib "user32" () As Long
+    Private Declare Function SetClipboardData Lib "user32" (ByVal wFormat As Long, ByVal hMem As Long) As Long
+    Private Declare Function GlobalAlloc Lib "kernel32" (ByVal wFlags As Long, ByVal dwBytes As Long) As Long
+    Private Declare Function GlobalLock Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function GlobalUnlock Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function GlobalFree Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function lstrcpyW Lib "kernel32" (ByVal lpString1 As Long, ByVal lpString2 As Long) As Long
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
+
+Private Const CF_UNICODETEXT As Long = 13
+Private Const GMEM_MOVEABLE As Long = &H2&
+
+'========================
 ' 可调参数（按需改）
 '========================
 Private Const TABLE_WIDTH As String = "70%"     ' 例如 "100%" / "70%"
@@ -44,8 +74,11 @@ Public Sub CopySelectionToBBCodeTable()
     Dim bb As String
     bb = RangeToBBCodeTable(rng)
 
-    CopyTextToClipboard bb
-    MsgBox "已复制 BBCode 到剪贴板。去论坛直接粘贴即可。", vbInformation
+    If CopyTextToClipboard(bb) Then
+        MsgBox "已复制 BBCode 到剪贴板。去论坛直接粘贴即可。", vbInformation
+    Else
+        MsgBox "复制到剪贴板失败，请关闭可能占用剪贴板的程序后重试。", vbExclamation
+    End If
 End Sub
 
 '========================
@@ -528,21 +561,73 @@ Private Function ClosestNamedColor(ByVal colorLong As Long) As String
 End Function
 
 '========================
-' 复制到剪贴板（无需勾引用：晚绑定）
+' 复制 Unicode 文本到 Windows 剪贴板（不依赖 MSForms）
 '========================
-Private Sub CopyTextToClipboard(ByVal text As String)
-    On Error GoTo Fallback
+Private Function CopyTextToClipboard(ByVal text As String) As Boolean
+    On Error GoTo CleanFail
 
-    Dim obj As Object
-    Set obj = CreateObject("MSForms.DataObject")
-    obj.SetText text
-    obj.PutInClipboard
-    Exit Sub
+#If VBA7 Then
+    Dim hMemory As LongPtr
+    Dim pMemory As LongPtr
+    Dim setResult As LongPtr
+#Else
+    Dim hMemory As Long
+    Dim pMemory As Long
+    Dim setResult As Long
+#End If
 
-Fallback:
-    ' 兜底：新建工作簿，避免覆盖当前工作簿中的 A1
-    Dim ws As Worksheet
-    Set ws = Workbooks.Add(xlWBATWorksheet).Worksheets(1)
-    ws.Range("A1").Value = text
-    MsgBox "自动复制失败，已新建工作簿并把结果写入 A1，请手动复制后关闭该工作簿。", vbExclamation
-End Sub
+    Dim clipboardIsOpen As Boolean
+    Dim byteCount As Long
+
+    If Not OpenClipboardWithRetry() Then Exit Function
+    clipboardIsOpen = True
+
+    If EmptyClipboard() = 0 Then GoTo CleanFail
+
+    byteCount = (Len(text) + 1) * 2
+    hMemory = GlobalAlloc(GMEM_MOVEABLE, byteCount)
+    If hMemory = 0 Then GoTo CleanFail
+
+    pMemory = GlobalLock(hMemory)
+    If pMemory = 0 Then GoTo CleanFail
+
+    If lstrcpyW(pMemory, StrPtr(text)) = 0 Then GoTo CleanFail
+
+    Call GlobalUnlock(hMemory)
+    pMemory = 0
+
+    setResult = SetClipboardData(CF_UNICODETEXT, hMemory)
+    If setResult = 0 Then GoTo CleanFail
+
+    ' SetClipboardData 成功后，内存所有权交给系统
+    hMemory = 0
+    Call CloseClipboard
+    clipboardIsOpen = False
+
+    CopyTextToClipboard = True
+    Exit Function
+
+CleanFail:
+    On Error Resume Next
+    If pMemory <> 0 Then Call GlobalUnlock(hMemory)
+    If hMemory <> 0 Then Call GlobalFree(hMemory)
+    If clipboardIsOpen Then Call CloseClipboard
+End Function
+
+Private Function OpenClipboardWithRetry() As Boolean
+    Dim attempt As Long
+
+    For attempt = 1 To 20
+#If VBA7 Then
+        If OpenClipboard(CLngPtr(Application.hwnd)) <> 0 Then
+#Else
+        If OpenClipboard(Application.hwnd) <> 0 Then
+#End If
+            OpenClipboardWithRetry = True
+            Exit Function
+        End If
+
+        DoEvents
+        Sleep 25
+    Next attempt
+End Function
