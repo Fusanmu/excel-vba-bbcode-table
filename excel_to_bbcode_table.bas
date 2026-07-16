@@ -1,6 +1,36 @@
 Option Explicit
 
 '========================
+' Windows Unicode 剪贴板 API（兼容 32/64 位 Office）
+'========================
+#If VBA7 Then
+    Private Declare PtrSafe Function OpenClipboard Lib "user32" (ByVal hwnd As LongPtr) As Long
+    Private Declare PtrSafe Function EmptyClipboard Lib "user32" () As Long
+    Private Declare PtrSafe Function CloseClipboard Lib "user32" () As Long
+    Private Declare PtrSafe Function SetClipboardData Lib "user32" (ByVal wFormat As Long, ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalAlloc Lib "kernel32" (ByVal wFlags As Long, ByVal dwBytes As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalLock Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function GlobalUnlock Lib "kernel32" (ByVal hMem As LongPtr) As Long
+    Private Declare PtrSafe Function GlobalFree Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+    Private Declare PtrSafe Function lstrcpyW Lib "kernel32" (ByVal lpString1 As LongPtr, ByVal lpString2 As LongPtr) As LongPtr
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Private Declare Function OpenClipboard Lib "user32" (ByVal hwnd As Long) As Long
+    Private Declare Function EmptyClipboard Lib "user32" () As Long
+    Private Declare Function CloseClipboard Lib "user32" () As Long
+    Private Declare Function SetClipboardData Lib "user32" (ByVal wFormat As Long, ByVal hMem As Long) As Long
+    Private Declare Function GlobalAlloc Lib "kernel32" (ByVal wFlags As Long, ByVal dwBytes As Long) As Long
+    Private Declare Function GlobalLock Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function GlobalUnlock Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function GlobalFree Lib "kernel32" (ByVal hMem As Long) As Long
+    Private Declare Function lstrcpyW Lib "kernel32" (ByVal lpString1 As Long, ByVal lpString2 As Long) As Long
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
+
+Private Const CF_UNICODETEXT As Long = 13
+Private Const GMEM_MOVEABLE As Long = &H2&
+
+'========================
 ' 可调参数（按需改）
 '========================
 Private Const TABLE_WIDTH As String = "70%"     ' 例如 "100%" / "70%"
@@ -12,7 +42,7 @@ Private Const TR_COLOR_USE_HEX As Boolean = True        ' tr 颜色用 #RRGGBB�
 Private Const USE_NESTED_CELL_TABLE As Boolean = True   ' 是否用嵌套表格模拟单个单元格背景色
 Private Const NESTED_TABLE_WIDTH As String = "100%"     ' 嵌套表格铺满外层单元格
 Private Const USE_DISPLAY_FORMAT As Boolean = True      ' 是否读取条件格式等实际显示出来的填充色
-Private Const ESCAPE_TEXT_BRACKETS As Boolean = True    ' 是否把文本里的 [ ] 转义，避免破坏 BBCode
+Private Const ESCAPE_TEXT_BRACKETS As Boolean = False   ' False 时保留 [sframe] 等单元格内的可信 BBCode
 
 '========================
 ' 入口宏
@@ -44,8 +74,11 @@ Public Sub CopySelectionToBBCodeTable()
     Dim bb As String
     bb = RangeToBBCodeTable(rng)
 
-    CopyTextToClipboard bb
-    MsgBox "已复制 BBCode 到剪贴板。去论坛直接粘贴即可。", vbInformation
+    If CopyTextToClipboard(bb) Then
+        MsgBox "已复制 BBCode 到剪贴板。去论坛直接粘贴即可。", vbInformation
+    Else
+        MsgBox "复制到剪贴板失败，请关闭可能占用剪贴板的程序后重试。", vbExclamation
+    End If
 End Sub
 
 '========================
@@ -188,19 +221,22 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
     Dim content As String
     content = GetCellDisplayText(cell)
 
+    Dim preserveBBCode As Boolean
+    preserveBBCode = (Not ESCAPE_TEXT_BRACKETS) And ContainsPairedBBCode(content)
+
     If ESCAPE_TEXT_BRACKETS Then
         content = Replace(content, "[", "&#91;")
         content = Replace(content, "]", "&#93;")
     End If
 
-    ' 换行 -> [br]
-    content = NormalizeLineBreaksToBr(content)
+    ' Keylol 不识别 [br]，保留为论坛能够渲染的真实换行
+    content = NormalizeLineBreaks(content)
 
     ' 空内容给个不可见占位，确保背景色表格仍有可见高度
     If Len(content) = 0 Then content = "　"
 
-    ' 字体样式（按整个单元格，不做逐字富文本）
-    content = ApplyFontStyle(cell, content)
+    ' 已有论坛标签原样保留，避免 [sframe] 被 size/b 等样式标签包裹
+    If Not preserveBBCode Then content = ApplyFontStyle(cell, content)
 
     ' 对齐放在嵌套表格里面，避免居中时把整张嵌套表格缩成内容宽度
     content = ApplyAlignment(cell, content)
@@ -211,11 +247,22 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
     content = WrapWithNestedTable(content, overrideBg)
 
     Dim tdOpen As String
-    tdOpen = "[td=" & rs & "," & cs
+    ' Discuz/Keylol 的参数顺序是 colspan,rowspan,width
+    tdOpen = "[td=" & cs & "," & rs
     If widthPct > 0 Then tdOpen = tdOpen & "," & CStr(widthPct) & "%"
     tdOpen = tdOpen & "]"
 
     BuildTd = tdOpen & content & "[/td]"
+End Function
+
+Private Function ContainsPairedBBCode(ByVal s As String) As Boolean
+    Dim openPos As Long, closePos As Long
+    openPos = InStr(1, s, "[", vbBinaryCompare)
+    closePos = InStr(1, s, "[/", vbBinaryCompare)
+
+    ContainsPairedBBCode = (openPos > 0) _
+                           And (InStr(openPos + 1, s, "]", vbBinaryCompare) > 0) _
+                           And (closePos > openPos)
 End Function
 
 '========================
@@ -408,13 +455,13 @@ SafeOut:
     GetCellDisplayText = CStr(cell.Value2)
 End Function
 
-Private Function NormalizeLineBreaksToBr(ByVal s As String) As String
+Private Function NormalizeLineBreaks(ByVal s As String) As String
     Dim t As String
     t = s
     t = Replace(t, vbCrLf, vbLf)
     t = Replace(t, vbCr, vbLf)
-    t = Replace(t, vbLf, "[br]")
-    NormalizeLineBreaksToBr = t
+    t = Replace(t, vbLf, vbCrLf)
+    NormalizeLineBreaks = t
 End Function
 
 '========================
@@ -514,21 +561,73 @@ Private Function ClosestNamedColor(ByVal colorLong As Long) As String
 End Function
 
 '========================
-' 复制到剪贴板（无需勾引用：晚绑定）
+' 复制 Unicode 文本到 Windows 剪贴板（不依赖 MSForms）
 '========================
-Private Sub CopyTextToClipboard(ByVal text As String)
-    On Error GoTo Fallback
+Private Function CopyTextToClipboard(ByVal text As String) As Boolean
+    On Error GoTo CleanFail
 
-    Dim obj As Object
-    Set obj = CreateObject("MSForms.DataObject")
-    obj.SetText text
-    obj.PutInClipboard
-    Exit Sub
+#If VBA7 Then
+    Dim hMemory As LongPtr
+    Dim pMemory As LongPtr
+    Dim setResult As LongPtr
+#Else
+    Dim hMemory As Long
+    Dim pMemory As Long
+    Dim setResult As Long
+#End If
 
-Fallback:
-    ' 兜底：新建工作簿，避免覆盖当前工作簿中的 A1
-    Dim ws As Worksheet
-    Set ws = Workbooks.Add(xlWBATWorksheet).Worksheets(1)
-    ws.Range("A1").Value = text
-    MsgBox "自动复制失败，已新建工作簿并把结果写入 A1，请手动复制后关闭该工作簿。", vbExclamation
-End Sub
+    Dim clipboardIsOpen As Boolean
+    Dim byteCount As Long
+
+    If Not OpenClipboardWithRetry() Then Exit Function
+    clipboardIsOpen = True
+
+    If EmptyClipboard() = 0 Then GoTo CleanFail
+
+    byteCount = (Len(text) + 1) * 2
+    hMemory = GlobalAlloc(GMEM_MOVEABLE, byteCount)
+    If hMemory = 0 Then GoTo CleanFail
+
+    pMemory = GlobalLock(hMemory)
+    If pMemory = 0 Then GoTo CleanFail
+
+    If lstrcpyW(pMemory, StrPtr(text)) = 0 Then GoTo CleanFail
+
+    Call GlobalUnlock(hMemory)
+    pMemory = 0
+
+    setResult = SetClipboardData(CF_UNICODETEXT, hMemory)
+    If setResult = 0 Then GoTo CleanFail
+
+    ' SetClipboardData 成功后，内存所有权交给系统
+    hMemory = 0
+    Call CloseClipboard
+    clipboardIsOpen = False
+
+    CopyTextToClipboard = True
+    Exit Function
+
+CleanFail:
+    On Error Resume Next
+    If pMemory <> 0 Then Call GlobalUnlock(hMemory)
+    If hMemory <> 0 Then Call GlobalFree(hMemory)
+    If clipboardIsOpen Then Call CloseClipboard
+End Function
+
+Private Function OpenClipboardWithRetry() As Boolean
+    Dim attempt As Long
+
+    For attempt = 1 To 20
+#If VBA7 Then
+        If OpenClipboard(CLngPtr(Application.hwnd)) <> 0 Then
+#Else
+        If OpenClipboard(Application.hwnd) <> 0 Then
+#End If
+            OpenClipboardWithRetry = True
+            Exit Function
+        End If
+
+        DoEvents
+        Sleep 25
+    Next attempt
+End Function
