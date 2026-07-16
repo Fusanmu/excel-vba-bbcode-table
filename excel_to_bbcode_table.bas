@@ -12,7 +12,7 @@ Private Const TR_COLOR_USE_HEX As Boolean = True        ' tr 颜色用 #RRGGBB�
 Private Const USE_NESTED_CELL_TABLE As Boolean = True   ' 是否用嵌套表格模拟单个单元格背景色
 Private Const NESTED_TABLE_WIDTH As String = "100%"     ' 嵌套表格铺满外层单元格
 Private Const USE_DISPLAY_FORMAT As Boolean = True      ' 是否读取条件格式等实际显示出来的填充色
-Private Const ESCAPE_TEXT_BRACKETS As Boolean = True    ' 是否把文本里的 [ ] 转义，避免破坏 BBCode
+Private Const ESCAPE_TEXT_BRACKETS As Boolean = False   ' False 时保留 [sframe] 等单元格内的可信 BBCode
 
 '========================
 ' 入口宏
@@ -188,19 +188,22 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
     Dim content As String
     content = GetCellDisplayText(cell)
 
+    Dim preserveBBCode As Boolean
+    preserveBBCode = (Not ESCAPE_TEXT_BRACKETS) And ContainsPairedBBCode(content)
+
     If ESCAPE_TEXT_BRACKETS Then
         content = Replace(content, "[", "&#91;")
         content = Replace(content, "]", "&#93;")
     End If
 
-    ' 换行 -> [br]
-    content = NormalizeLineBreaksToBr(content)
+    ' Keylol 不识别 [br]，保留为论坛能够渲染的真实换行
+    content = NormalizeLineBreaks(content)
 
     ' 空内容给个不可见占位，确保背景色表格仍有可见高度
     If Len(content) = 0 Then content = "　"
 
-    ' 字体样式（按整个单元格，不做逐字富文本）
-    content = ApplyFontStyle(cell, content)
+    ' 已有论坛标签原样保留，避免 [sframe] 被 size/b 等样式标签包裹
+    If Not preserveBBCode Then content = ApplyFontStyle(cell, content)
 
     ' 对齐放在嵌套表格里面，避免居中时把整张嵌套表格缩成内容宽度
     content = ApplyAlignment(cell, content)
@@ -211,11 +214,22 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
     content = WrapWithNestedTable(content, overrideBg)
 
     Dim tdOpen As String
-    tdOpen = "[td=" & rs & "," & cs
+    ' Discuz/Keylol 的参数顺序是 colspan,rowspan,width
+    tdOpen = "[td=" & cs & "," & rs
     If widthPct > 0 Then tdOpen = tdOpen & "," & CStr(widthPct) & "%"
     tdOpen = tdOpen & "]"
 
     BuildTd = tdOpen & content & "[/td]"
+End Function
+
+Private Function ContainsPairedBBCode(ByVal s As String) As Boolean
+    Dim openPos As Long, closePos As Long
+    openPos = InStr(1, s, "[", vbBinaryCompare)
+    closePos = InStr(1, s, "[/", vbBinaryCompare)
+
+    ContainsPairedBBCode = (openPos > 0) _
+                           And (InStr(openPos + 1, s, "]", vbBinaryCompare) > 0) _
+                           And (closePos > openPos)
 End Function
 
 '========================
@@ -408,13 +422,13 @@ SafeOut:
     GetCellDisplayText = CStr(cell.Value2)
 End Function
 
-Private Function NormalizeLineBreaksToBr(ByVal s As String) As String
+Private Function NormalizeLineBreaks(ByVal s As String) As String
     Dim t As String
     t = s
     t = Replace(t, vbCrLf, vbLf)
     t = Replace(t, vbCr, vbLf)
-    t = Replace(t, vbLf, "[br]")
-    NormalizeLineBreaksToBr = t
+    t = Replace(t, vbLf, vbCrLf)
+    NormalizeLineBreaks = t
 End Function
 
 '========================
