@@ -9,8 +9,9 @@ Private Const TABLE_BG As String = "white"      ' table 默认背景（论坛支
 Private Const USE_ROW_MODE_COLOR As Boolean = True      ' 是否给 tr 上“行主色”
 Private Const TR_COLOR_USE_HEX As Boolean = True        ' tr 颜色用 #RRGGBB（否则尝试映射成 lightblue 等少量名字）
 
-Private Const USE_CELL_BACKCOLOR As Boolean = True      ' 是否对“异色单元格”套 [backcolor]
-Private Const BACKCOLOR_PAD_FULLWIDTH As Boolean = True ' backcolor 内侧是否加全角空格，增强“色块感”
+Private Const USE_NESTED_CELL_TABLE As Boolean = True   ' 是否用嵌套表格模拟单个单元格背景色
+Private Const NESTED_TABLE_WIDTH As String = "100%"     ' 嵌套表格铺满外层单元格
+Private Const USE_DISPLAY_FORMAT As Boolean = True      ' 是否读取条件格式等实际显示出来的填充色
 Private Const ESCAPE_TEXT_BRACKETS As Boolean = True    ' 是否把文本里的 [ ] 转义，避免破坏 BBCode
 
 '========================
@@ -26,12 +27,22 @@ Public Sub CopySelectionToBBCodeTable()
 
     Set rng = Selection
 
+    If rng.Areas.Count <> 1 Then
+        MsgBox "请选择一个连续的矩形区域。", vbExclamation
+        Exit Sub
+    End If
+
+    If ContainsPartialMergedArea(rng) Then
+        MsgBox "选区只包含了部分合并单元格，请把相关合并单元格完整选中。", vbExclamation
+        Exit Sub
+    End If
+
     If rng.Cells.CountLarge > 200000 Then
         If MsgBox("选区很大，导出可能较慢。继续吗？", vbYesNo + vbQuestion) <> vbYes Then Exit Sub
     End If
 
     Dim bb As String
-    bb = BuildBBCodeTable(rng)
+    bb = RangeToBBCodeTable(rng)
 
     CopyTextToClipboard bb
     MsgBox "已复制 BBCode 到剪贴板。去论坛直接粘贴即可。", vbInformation
@@ -40,13 +51,15 @@ End Sub
 '========================
 ' 生成整张表
 '========================
-Private Function BuildBBCodeTable(ByVal rng As Range) As String
+Public Function RangeToBBCodeTable(ByVal rng As Range) As String
     Dim rCount As Long, cCount As Long
     rCount = rng.Rows.Count
     cCount = rng.Columns.Count
 
-    Dim sb As String
-    sb = sb & "[table=" & TABLE_WIDTH & "," & TABLE_BG & "]" & vbCrLf
+    ' Collection + Join 避免大选区反复拼接长字符串造成性能退化
+    Dim parts As Collection
+    Set parts = New Collection
+    parts.Add "[table=" & TABLE_WIDTH & "," & TABLE_BG & "]"
 
     ' 用来跳过合并单元格中非左上角的格子
     Dim seen As Object
@@ -63,7 +76,7 @@ Private Function BuildBBCodeTable(ByVal rng As Range) As String
 
         Dim trTag As String
         trTag = BuildTrTag(rowModeColor)
-        sb = sb & trTag & vbCrLf
+        parts.Add trTag
 
         For c = 1 To cCount
             Dim cell As Range
@@ -71,14 +84,55 @@ Private Function BuildBBCodeTable(ByVal rng As Range) As String
 
             Dim td As String
             td = BuildTd(cell, rng, rowModeColor, seen)
-            If Len(td) > 0 Then sb = sb & td & vbCrLf
+            If Len(td) > 0 Then parts.Add td
         Next c
 
-        sb = sb & "[/tr]" & vbCrLf
+        parts.Add "[/tr]"
     Next r
 
-    sb = sb & "[/table]"
-    BuildBBCodeTable = sb
+    parts.Add "[/table]"
+
+    Dim output() As String
+    ReDim output(0 To parts.Count - 1)
+
+    Dim i As Long
+    For i = 1 To parts.Count
+        output(i - 1) = CStr(parts(i))
+    Next i
+
+    RangeToBBCodeTable = Join(output, vbCrLf)
+End Function
+
+Private Function ContainsPartialMergedArea(ByVal rng As Range) As Boolean
+    Dim seen As Object
+    Set seen = CreateObject("Scripting.Dictionary")
+
+    Dim cell As Range
+    For Each cell In rng.Cells
+        If cell.MergeCells Then
+            Dim ma As Range
+            Set ma = cell.MergeArea
+
+            Dim key As String
+            key = ma.Address(External:=True)
+
+            If Not seen.Exists(key) Then
+                seen.Add key, True
+
+                Dim overlap As Range
+                Set overlap = Application.Intersect(rng, ma)
+                If overlap Is Nothing Then
+                    ContainsPartialMergedArea = True
+                    Exit Function
+                End If
+
+                If overlap.Cells.CountLarge <> ma.Cells.CountLarge Then
+                    ContainsPartialMergedArea = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next cell
 End Function
 
 '========================
@@ -98,7 +152,7 @@ Private Function BuildTrTag(ByVal rowModeColor As Variant) As String
 End Function
 
 '========================
-' td 构建（含合并单元格、对齐、字体、backcolor）
+' td 构建（含合并单元格、对齐、字体、嵌套背景表格）
 '========================
 Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowModeColor As Variant, ByVal seen As Object) As String
     ' 合并单元格处理：只输出 MergeArea 的左上角
@@ -142,19 +196,19 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
     ' 换行 -> [br]
     content = NormalizeLineBreaksToBr(content)
 
-    ' 空内容给个不可见占位，避免 backcolor 看不出来
+    ' 空内容给个不可见占位，确保背景色表格仍有可见高度
     If Len(content) = 0 Then content = "　"
 
     ' 字体样式（按整个单元格，不做逐字富文本）
     content = ApplyFontStyle(cell, content)
 
-    ' 用 backcolor 模拟“单元格底色差异”
-    If USE_CELL_BACKCOLOR Then
-        content = WrapWithBackcolor(cell, content, rowModeColor)
-    End If
-
-    ' 对齐
+    ' 对齐放在嵌套表格里面，避免居中时把整张嵌套表格缩成内容宽度
     content = ApplyAlignment(cell, content)
+
+    ' Keylol 的 td 不支持单独背景色，用铺满单元格的嵌套表格模拟
+    Dim overrideBg As String
+    overrideBg = GetCellBackgroundOverride(cell, rowModeColor)
+    content = WrapWithNestedTable(content, overrideBg)
 
     Dim tdOpen As String
     tdOpen = "[td=" & rs & "," & cs
@@ -165,17 +219,26 @@ Private Function BuildTd(ByVal cell As Range, ByVal whole As Range, ByVal rowMod
 End Function
 
 '========================
-' 行主色：统计该行在选区内最常见的填充色（忽略无填充）
+' 行主色：仅当某种填充色占该行严格多数时采用
+' 无填充也参与统计，避免一个孤立色块被误判成整行底色
 '========================
 Private Function GetRowModeFillColor(ByVal rowRng As Range) As Variant
     Dim freq As Object
     Set freq = CreateObject("Scripting.Dictionary")
 
     Dim cell As Range
+    Dim totalCells As Long
+    totalCells = 0
+
     For Each cell In rowRng.Cells
-        If HasCellFill(cell) Then
+        totalCells = totalCells + 1
+
+        Dim fillColor As Variant
+        fillColor = GetCellFillColor(cell)
+
+        If Not IsEmpty(fillColor) Then
             Dim k As String
-            k = CStr(cell.Interior.Color)
+            k = CStr(CLng(fillColor))
 
             If freq.Exists(k) Then
                 freq(k) = CLng(freq(k)) + 1
@@ -201,43 +264,69 @@ Private Function GetRowModeFillColor(ByVal rowRng As Range) As Variant
         End If
     Next kk
 
-    GetRowModeFillColor = CLng(bestKey)
+    If bestN * 2 <= totalCells Then
+        GetRowModeFillColor = Empty
+    Else
+        GetRowModeFillColor = CLng(bestKey)
+    End If
 End Function
 
-Private Function HasCellFill(ByVal cell As Range) As Boolean
-    On Error GoTo SafeOut
-    HasCellFill = (cell.Interior.Pattern <> xlNone) And (cell.Interior.ColorIndex <> xlColorIndexNone)
+Private Function GetCellFillColor(ByVal cell As Range) As Variant
+    If USE_DISPLAY_FORMAT Then
+        On Error GoTo UseInterior
+
+        If cell.DisplayFormat.Interior.Pattern <> xlNone _
+           And cell.DisplayFormat.Interior.ColorIndex <> xlColorIndexNone Then
+            GetCellFillColor = CLng(cell.DisplayFormat.Interior.Color)
+        Else
+            GetCellFillColor = Empty
+        End If
+        Exit Function
+    End If
+
+UseInterior:
+    On Error GoTo NoFill
+
+    If cell.Interior.Pattern <> xlNone _
+       And cell.Interior.ColorIndex <> xlColorIndexNone Then
+        GetCellFillColor = CLng(cell.Interior.Color)
+    Else
+        GetCellFillColor = Empty
+    End If
     Exit Function
 
-SafeOut:
-    HasCellFill = False
+NoFill:
+    GetCellFillColor = Empty
 End Function
 
 '========================
-' backcolor 包裹（仅当：单元格有填充色 且 <> 行主色）
+' 计算单元格相对行背景需要覆盖的颜色
 '========================
-Private Function WrapWithBackcolor(ByVal cell As Range, ByVal s As String, ByVal rowModeColor As Variant) As String
-    If Not HasCellFill(cell) Then
-        WrapWithBackcolor = s
+Private Function GetCellBackgroundOverride(ByVal cell As Range, ByVal rowModeColor As Variant) As String
+    Dim fillColor As Variant
+    fillColor = GetCellFillColor(cell)
+
+    If IsEmpty(fillColor) Then
+        ' tr 有底色时，无填充单元格需要恢复表格默认背景
+        If Not IsEmpty(rowModeColor) Then GetCellBackgroundOverride = TABLE_BG
         Exit Function
     End If
 
     If Not IsEmpty(rowModeColor) Then
-        If cell.Interior.Color = CLng(rowModeColor) Then
-            WrapWithBackcolor = s
-            Exit Function
-        End If
+        If CLng(fillColor) = CLng(rowModeColor) Then Exit Function
     End If
 
-    Dim inner As String
-    inner = s
-    If Len(inner) = 0 Then inner = "　"
+    GetCellBackgroundOverride = ColorLongToHex(CLng(fillColor))
+End Function
 
-    If BACKCOLOR_PAD_FULLWIDTH Then
-        WrapWithBackcolor = "[backcolor=" & ColorLongToHex(cell.Interior.Color) & "]　" & inner & "　[/backcolor]"
-    Else
-        WrapWithBackcolor = "[backcolor=" & ColorLongToHex(cell.Interior.Color) & "]" & inner & "[/backcolor]"
+Private Function WrapWithNestedTable(ByVal s As String, ByVal bgColor As String) As String
+    If Not USE_NESTED_CELL_TABLE Or Len(bgColor) = 0 Then
+        WrapWithNestedTable = s
+        Exit Function
     End If
+
+    WrapWithNestedTable = "[table=" & NESTED_TABLE_WIDTH & "," & bgColor & "]" _
+                          & "[tr][td]" & s & "[/td][/tr][/table]"
 End Function
 
 '========================
@@ -298,11 +387,11 @@ Private Function FontSizeToBBSize(ByVal pt As Double) As String
     ' 简单映射：你可按论坛实际效果微调
     Select Case pt
         Case Is <= 8: FontSizeToBBSize = "1"
-        Case 9 To 10: FontSizeToBBSize = "2"
-        Case 11 To 12: FontSizeToBBSize = "3"
-        Case 13 To 14: FontSizeToBBSize = "4"
-        Case 15 To 18: FontSizeToBBSize = "5"
-        Case 19 To 24: FontSizeToBBSize = "6"
+        Case Is <= 10: FontSizeToBBSize = "2"
+        Case Is <= 12: FontSizeToBBSize = "3"
+        Case Is <= 14: FontSizeToBBSize = "4"
+        Case Is <= 18: FontSizeToBBSize = "5"
+        Case Is <= 24: FontSizeToBBSize = "6"
         Case Else: FontSizeToBBSize = "7"
     End Select
 End Function
@@ -329,7 +418,7 @@ Private Function NormalizeLineBreaksToBr(ByVal s As String) As String
 End Function
 
 '========================
-' 列宽百分比（简单平均；合并列取合并宽）
+' 列宽百分比（按 Excel 实际列宽；合并列取各列宽度之和）
 '========================
 Private Function GetColumnWidthPercent(ByVal cell As Range, ByVal whole As Range, ByVal colspan As Long) As Long
     Dim totalCols As Long
@@ -340,15 +429,37 @@ Private Function GetColumnWidthPercent(ByVal cell As Range, ByVal whole As Range
         Exit Function
     End If
 
-    ' 平均分配（更稳；不依赖 Excel 的实际列宽）
-    Dim base As Double
-    base = 100# / CDbl(totalCols)
+    On Error GoTo EqualWidth
+
+    Dim totalWidth As Double, targetWidth As Double
+    Dim i As Long, firstIndex As Long, lastIndex As Long
+
+    For i = 1 To totalCols
+        totalWidth = totalWidth + CDbl(whole.Columns(i).ColumnWidth)
+    Next i
+
+    firstIndex = cell.Column - whole.Column + 1
+    lastIndex = firstIndex + colspan - 1
+    If firstIndex < 1 Then firstIndex = 1
+    If lastIndex > totalCols Then lastIndex = totalCols
+
+    For i = firstIndex To lastIndex
+        targetWidth = targetWidth + CDbl(whole.Columns(i).ColumnWidth)
+    Next i
+
+    If totalWidth <= 0 Or targetWidth <= 0 Then GoTo EqualWidth
 
     Dim w As Double
-    w = base * CDbl(colspan)
+    w = 100# * targetWidth / totalWidth
 
-    ' 取整到 1%
-    GetColumnWidthPercent = CLng(Application.WorksheetFunction.Max(1, Application.WorksheetFunction.Round(w, 0)))
+    GetColumnWidthPercent = CLng(Int(w + 0.5))
+    If GetColumnWidthPercent < 1 Then GetColumnWidthPercent = 1
+    If GetColumnWidthPercent > 100 Then GetColumnWidthPercent = 100
+    Exit Function
+
+EqualWidth:
+    GetColumnWidthPercent = CLng(Int((100# * CDbl(colspan) / CDbl(totalCols)) + 0.5))
+    If GetColumnWidthPercent < 1 Then GetColumnWidthPercent = 1
 End Function
 
 '========================
@@ -415,10 +526,9 @@ Private Sub CopyTextToClipboard(ByVal text As String)
     Exit Sub
 
 Fallback:
-    ' 兜底：写到一个临时单元格让你手动复制
+    ' 兜底：新建工作簿，避免覆盖当前工作簿中的 A1
     Dim ws As Worksheet
-    Set ws = ActiveWorkbook.Worksheets(1)
+    Set ws = Workbooks.Add(xlWBATWorksheet).Worksheets(1)
     ws.Range("A1").Value = text
-    MsgBox "自动复制失败，已把结果写入 " & ws.Name & "!A1，请手动复制。", vbExclamation
+    MsgBox "自动复制失败，已新建工作簿并把结果写入 A1，请手动复制后关闭该工作簿。", vbExclamation
 End Sub
-
